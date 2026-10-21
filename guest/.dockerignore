@@ -1,0 +1,5 @@
+assets
+*.test
+*.out
+.DS_Store
+__pycache__

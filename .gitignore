@@ -1,0 +1,15 @@
+.build/
+.swiftpm/
+.DS_Store
+dist/
+.sapphire/
+*.xcuserstate
+*.rea.backup
+engine/build/
+engine/bin/
+native/build/
+guest/build/
+guest/assets/
+benchmarks/results/
+benchmarks/build/
+__pycache__/

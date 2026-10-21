@@ -1,0 +1,77 @@
+#!/bin/busybox sh
+set -eu
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+fatal() {
+    echo "SAPPHIRE INITRAMFS ERROR: $*" >/dev/console
+    echo "Boot halted without further disk writes. Inspect the VM console." >/dev/console
+    while :; do sleep 3600; done
+}
+
+/bin/busybox mkdir -p /dev /proc /sys /run /ro /data /newroot
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+echo "Sapphire initramfs: loading boot device dependencies"
+
+# virtio_vsock's actual Linux module name is vmw_vsock_virtio_transport.
+# kmod resolves dependencies; modules.builtin covers built-in drivers.
+for module in virtio_mmio virtio_blk virtio_net vmw_vsock_virtio_transport \
+    virtio_balloon virtio_console virtio_rng loop squashfs overlay ext4; do
+    modprobe "$module" || fatal "cannot load $module"
+done
+
+count=0
+while [ ! -b /dev/vda ] || [ ! -b /dev/vdb ]; do
+    count=$((count + 1))
+    [ "$count" -lt 150 ] || fatal "missing /dev/vda squashfs or /dev/vdb data disk"
+    sleep 0.1
+done
+
+mount -t squashfs -o ro /dev/vda /ro || fatal "cannot mount immutable /dev/vda"
+set +e
+kind=$(blkid -p -s TYPE -o value /dev/vdb)
+probe_status=$?
+set -e
+if [ "$probe_status" -eq 0 ]; then
+    [ "$kind" = ext4 ] || fatal "data disk has existing non-ext4 filesystem: $kind"
+    label=$(blkid -p -s LABEL -o value /dev/vdb) || fatal "cannot read data disk label"
+    [ "$label" = sapphire-data ] || fatal "data disk is not labeled sapphire-data"
+elif [ "$probe_status" -eq 2 ]; then
+    if [ -e /sys/firmware/devicetree/base/chosen/sapphire,initialize-data-disk ]; then
+        # The host sets this launch-only flag solely after O_EXCL creation and
+        # Truncate of the new data file. It proves fresh creation, not merely
+        # an unrecognized filesystem. Never bypass recognized-disk validation.
+        echo "Initializing data disk with host-proven fresh-file provenance"
+    else
+        # No recognized signature alone is NOT evidence that a disk is blank.
+        /sbin/sapphire-guest --check-blank-device /dev/vdb || fatal "refusing to format nonblank or unreadable data disk"
+    fi
+    mkfs.ext4 -q -L sapphire-data -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 /dev/vdb \
+        || fatal "cannot format blank data disk"
+else
+    fatal "blkid returned $probe_status; no disk will be formatted"
+fi
+
+mount -t ext4 -o noatime /dev/vdb /data || fatal "cannot mount data disk"
+mkdir -p /data/upper /data/work
+mount -t overlay overlay -o lowerdir=/ro,upperdir=/data/upper,workdir=/data/work /newroot \
+    || fatal "cannot mount writable overlay"
+# overlay2 needs a real ext4 upper backing filesystem, not the root overlay.
+# Machine disks and Kubernetes state share this data disk, never another VM.
+for directory in docker sapphire rancher kubelet cni; do
+    mkdir -p "/data/persist/$directory" "/newroot/var/lib/$directory"
+    mount -o bind "/data/persist/$directory" "/newroot/var/lib/$directory" \
+        || fatal "cannot bind persistent $directory storage"
+done
+mkdir -p /newroot/mnt/sapphire/base /newroot/mnt/sapphire/data
+mount --move /ro /newroot/mnt/sapphire/base
+mount --move /data /newroot/mnt/sapphire/data
+for directory in dev proc sys run; do
+    mkdir -p "/newroot/$directory"
+    mount --move "/$directory" "/newroot/$directory"
+done
+echo "Sapphire initramfs: switching to guest PID 1"
+exec switch_root /newroot /sbin/sapphire-guest
