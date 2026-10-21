@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,7 +19,7 @@ import (
 
 func TestDockerInitialSnapshotAndEventsUsePublishedHostPort(t *testing.T) {
 	hosts := []string{
-		"127.0.0.1", "127.0.0.1", "127.0.0.1", "127.0.0.1",
+		"127.0.0.1", "127.0.0.1", "127.0.0.1", "::1",
 		"127.0.0.2", "192.168.128.2",
 	}
 	hostPorts := make([]int, len(hosts))
@@ -258,5 +260,64 @@ func waitFor(t *testing.T, condition func() bool) {
 			t.Fatal("condition did not become true")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+// Model the guest endpoint with an IPv6-only socket, while the host forward
+// remains private IPv4. The target uses the same JSON record as DialTCP.
+func TestDockerIPv6LoopbackForward(t *testing.T) {
+	guest, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guest.Close()
+	port := guest.Addr().(*net.TCPAddr).Port
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port))); err == nil {
+		conn.Close()
+		t.Fatal("IPv4 negative control unexpectedly connected")
+	}
+	go func() {
+		conn, err := guest.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.WriteString(conn, "ipv6-only")
+	}()
+	manager := New(ctx, func(ctx context.Context, target vsock.Target) (net.Conn, error) {
+		record, err := json.Marshal(target)
+		if err != nil {
+			return nil, err
+		}
+		var request vsock.Target
+		if err := json.Unmarshal(record, &request); err != nil {
+			return nil, err
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(request.Host, strconv.Itoa(request.Port)))
+	})
+	defer manager.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{{"Ports": []map[string]any{{"IP": "::1", "PrivatePort": 80, "PublicPort": port, "Type": "tcp"}}}})
+	}))
+	defer server.Close()
+	watch := NewDockerWatch(vsock.Client{}, manager, func(err error) { t.Error(err) })
+	defer watch.Stop()
+	watch.transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp4", strings.TrimPrefix(server.URL, "http://"))
+	}
+	if err := watch.refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(conn)
+	if err != nil || string(got) != "ipv6-only" {
+		t.Fatalf("forward got %q, %v", got, err)
 	}
 }

@@ -243,6 +243,52 @@ static void test_completion_irq(void)
     destroy(&vm);
 }
 
+/* Store/load litmus: either the guest observes used.idx or the device must
+ * interrupt after notifications are reenabled. Stress is not a proof of ordering. */
+struct completion_race {
+    struct vm *vm;
+    struct virtq *q;
+    atomic_uint start, done;
+};
+
+static void *complete_racing(void *arg)
+{
+    struct completion_race *race = arg;
+    struct chain c = {.head = 0, .writable = 8};
+    for (unsigned i = 1; i <= 100000; ++i) {
+        while (atomic_load_explicit(&race->start, memory_order_acquire) != i) {}
+        queue_complete(race->vm, &race->vm->dev[0], race->q, &c, 8);
+        atomic_store_explicit(&race->done, i, memory_order_release);
+    }
+    return NULL;
+}
+
+static void test_notification_reenable_race(void)
+{
+    struct vm vm;
+    init(&vm);
+    vm.set_irq = NULL;
+    struct virtq *q = setup_queue(&vm, 0, 0);
+    uint16_t *flags = guest_ptr(&vm.mem, q->avail, 2);
+    uint16_t *used_idx = guest_ptr(&vm.mem, q->used + 2, 2);
+    struct completion_race race = {.vm = &vm, .q = q};
+    pthread_t worker;
+    CHECK(!pthread_create(&worker, NULL, complete_racing, &race));
+    for (unsigned i = 1; i <= 100000; ++i) {
+        vm.dev[0].interrupt = 0;
+        __atomic_store_n(flags, 1, __ATOMIC_RELAXED);
+        uint16_t old = (uint16_t)(i - 1);
+        atomic_store_explicit(&race.start, i, memory_order_release);
+        __atomic_store_n(flags, 0, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        uint16_t observed = __atomic_load_n(used_idx, __ATOMIC_ACQUIRE);
+        while (atomic_load_explicit(&race.done, memory_order_acquire) != i) {}
+        CHECK(observed != old || (vm.dev[0].interrupt & 1));
+    }
+    CHECK(!pthread_join(worker, NULL));
+    destroy(&vm);
+}
+
 static void test_mmio_wake(void)
 {
     struct vm vm;
@@ -993,6 +1039,7 @@ int main(void)
     test_bounds();
     test_transport();
     test_completion_irq();
+    test_notification_reenable_race();
     test_mmio_wake();
     test_reporting();
     test_block();

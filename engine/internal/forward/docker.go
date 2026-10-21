@@ -195,7 +195,7 @@ func (w *DockerWatch) refresh(ctx context.Context) error {
 			}
 			host := port.IP
 			switch host {
-			case "", "0.0.0.0", "::", "::1":
+			case "", "0.0.0.0", "::":
 				host = "127.0.0.1"
 			}
 			if net.ParseIP(host) == nil {

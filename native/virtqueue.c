@@ -91,8 +91,11 @@ void queue_complete(struct vm *vm, struct device *d, struct virtq *q,
     st32(elem + 4, len);
     __atomic_store_n((uint16_t *)(void *)(used + 2), ++q->next_used,
                      __ATOMIC_RELEASE);
+    /* Pair with the guest's notification-enable barrier and used.idx recheck.
+     * A release store alone does not order this store before the flags load. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     uint8_t *avail = guest_ptr(&vm->mem, q->avail, 2);
-    if (!avail || !(ld16(avail) & 1)) {
+    if (!avail || !(__atomic_load_n((uint16_t *)(void *)avail, __ATOMIC_RELAXED) & 1)) {
         bool already_pending = d->interrupt != 0;
         d->interrupt |= 1;
         if (!already_pending && vm->set_irq)
