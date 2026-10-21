@@ -100,7 +100,11 @@ func TestDockerInitialSnapshotAndEventsUsePublishedHostPort(t *testing.T) {
 	}))
 	defer server.Close()
 	defer cancel()
-	watch := NewDockerWatch(vsock.Client{}, manager, func(err error) { t.Errorf("watcher: %v", err) })
+	watch := NewDockerWatch(vsock.Client{}, manager, func(err error) {
+		if !strings.Contains(err.Error(), "non-TCP host publications are unsupported") {
+			t.Errorf("watcher: %v", err)
+		}
+	})
 	defer watch.Stop()
 	watch.transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp4", strings.TrimPrefix(server.URL, "http://"))
@@ -319,5 +323,79 @@ func TestDockerIPv6LoopbackForward(t *testing.T) {
 	got, err := io.ReadAll(conn)
 	if err != nil || string(got) != "ipv6-only" {
 		t.Fatalf("forward got %q, %v", got, err)
+	}
+}
+
+func TestUnsupportedPublicationsWarnWithoutBreakingTCPOrPolling(t *testing.T) {
+	reservation, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reservation.Addr().(*net.TCPAddr).Port
+	reservation.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	manager := New(ctx, func(ctx context.Context, target vsock.Target) (net.Conn, error) {
+		if target.Host != "127.0.0.1" || target.Port != port {
+			return nil, fmt.Errorf("wrong TCP target: %+v", target)
+		}
+		host, guest := net.Pipe()
+		go func() {
+			defer guest.Close()
+			io.WriteString(guest, "tcp")
+		}()
+		return host, nil
+	})
+	defer manager.Close()
+	var published atomic.Bool
+	published.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ports := []map[string]any{
+			{"IP": "127.0.0.1", "PublicPort": port, "Type": "tcp"},
+			{"PrivatePort": 67, "Type": "udp"},
+		}
+		if published.Load() {
+			ports = append(ports, map[string]any{"IP": "127.0.0.1", "PublicPort": 53, "Type": "udp"})
+		}
+		json.NewEncoder(w).Encode([]map[string]any{{"Ports": ports}})
+	}))
+	defer server.Close()
+	var warnings []error
+	watch := NewDockerWatch(vsock.Client{}, manager, func(err error) { warnings = append(warnings, err) })
+	defer watch.transport.CloseIdleConnections()
+	watch.transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp4", strings.TrimPrefix(server.URL, "http://"))
+	}
+	for i := 0; i < 2; i++ {
+		if err := watch.refresh(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0].Error(), "UDP") {
+		t.Fatalf("unsupported UDP must warn once across repeated snapshots: %v", warnings)
+	}
+	conn, err := net.Dial("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(conn)
+	conn.Close()
+	if err != nil || string(got) != "tcp" {
+		t.Fatalf("supported TCP forwarding failed: %q, %v", got, err)
+	}
+	published.Store(false)
+	if err := watch.refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("unpublished UDP must not warn: %v", warnings)
+	}
+	published.Store(true)
+	if err := watch.refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 2 {
+		t.Fatalf("new unsupported publication was not reported: %v", warnings)
 	}
 }

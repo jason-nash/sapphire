@@ -75,8 +75,10 @@ func (d *Daemon) call(ctx context.Context, request protocol.Request) protocol.Re
 		d.actions.Lock()
 		defer d.actions.Unlock()
 	}
+	var apiForwardCreated bool
 	if request.Action == "k8s.start" {
-		_, err := d.forwards.Add(forward.Spec{Host: "127.0.0.1", Port: 6443, HostPort: 6443, Source: "k8s"})
+		var err error
+		_, apiForwardCreated, err = d.forwards.Ensure(forward.Spec{Host: "127.0.0.1", Port: 6443, HostPort: 6443, Source: "k8s"})
 		if err != nil {
 			return protocol.Failure(fmt.Errorf("Kubernetes API forward: %w", err))
 		}
@@ -96,7 +98,7 @@ func (d *Daemon) call(ctx context.Context, request protocol.Request) protocol.Re
 		response = protocol.Failure(err)
 	}
 	if !response.OK {
-		if request.Action == "k8s.start" {
+		if apiForwardCreated {
 			d.forwards.Remove(6443, "k8s")
 		}
 		return response

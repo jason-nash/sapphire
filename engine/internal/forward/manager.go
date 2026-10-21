@@ -41,11 +41,18 @@ func New(ctx context.Context, dial func(context.Context, vsock.Target) (net.Conn
 }
 
 func (m *Manager) Add(spec Spec) (Spec, error) {
+	actual, _, err := m.Ensure(spec)
+	return actual, err
+}
+
+// Ensure reports whether this call created the listener, so callers can roll back
+// their own acquisition without removing an existing forward.
+func (m *Manager) Ensure(spec Spec) (Spec, bool, error) {
 	if err := spec.target().Validate(); err != nil {
-		return Spec{}, err
+		return Spec{}, false, err
 	}
 	if spec.HostPort < 0 || spec.HostPort > 65535 {
-		return Spec{}, errors.New("hostPort must be between 0 and 65535")
+		return Spec{}, false, errors.New("hostPort must be between 0 and 65535")
 	}
 	if spec.Source == "" {
 		spec.Source = "manual"
@@ -53,17 +60,17 @@ func (m *Manager) Add(spec Spec) (Spec, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed || m.ctx.Err() != nil {
-		return Spec{}, errors.New("forwarding is closed")
+		return Spec{}, false, errors.New("forwarding is closed")
 	}
 	if existing, ok := m.entries[spec.HostPort]; ok {
 		if existing.spec == spec {
-			return spec, nil
+			return spec, false, nil
 		}
-		return Spec{}, fmt.Errorf("port %d is already forwarded by %s", spec.HostPort, existing.spec.Source)
+		return Spec{}, false, fmt.Errorf("port %d is already forwarded by %s", spec.HostPort, existing.spec.Source)
 	}
 	listener, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(spec.HostPort)))
 	if err != nil {
-		return Spec{}, err
+		return Spec{}, false, err
 	}
 	spec.HostPort = listener.Addr().(*net.TCPAddr).Port
 	ctx, cancel := context.WithCancel(m.ctx)
@@ -76,7 +83,7 @@ func (m *Manager) Add(spec Spec) (Spec, error) {
 		})
 		listener.Close()
 	}()
-	return spec, nil
+	return spec, true, nil
 }
 
 func (m *Manager) Remove(port int, source string) error {

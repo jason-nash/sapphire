@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sapphire/engine/internal/vsock"
@@ -17,14 +18,15 @@ import (
 // DockerWatch uses one blocking event stream, plus an initial snapshot. A lost
 // stream is reconnected with bounded backoff, never by periodically listing.
 type DockerWatch struct {
-	client     *http.Client
-	transport  *http.Transport
-	manager    *Manager
-	report     func(error)
-	mu         sync.Mutex
-	cancel     context.CancelFunc
-	done       chan struct{}
-	generation uint64
+	client                  *http.Client
+	transport               *http.Transport
+	manager                 *Manager
+	report                  func(error)
+	mu                      sync.Mutex
+	cancel                  context.CancelFunc
+	done                    chan struct{}
+	generation              uint64
+	unsupportedPublications atomic.Int64
 }
 
 func NewDockerWatch(client vsock.Client, manager *Manager, report func(error)) *DockerWatch {
@@ -110,6 +112,7 @@ func (w *DockerWatch) Stop() {
 	w.cancel()
 	<-w.done
 	w.cancel = nil
+	w.unsupportedPublications.Store(0)
 	w.transport.CloseIdleConnections()
 	w.manager.Sync("docker", nil)
 	w.mu.Unlock()
@@ -187,10 +190,14 @@ func (w *DockerWatch) refresh(ctx context.Context) error {
 		return err
 	}
 	wanted := make(map[int]Spec)
+	var unsupported int64
 	for _, c := range containers {
 		for _, port := range c.Ports {
-			// The guest proxy carries TCP streams. UDP stays explicitly unsupported.
-			if port.Type != "tcp" || port.PublicPort < 1 || port.PublicPort > 65535 {
+			if port.PublicPort < 1 || port.PublicPort > 65535 {
+				continue
+			}
+			if port.Type != "tcp" {
+				unsupported++
 				continue
 			}
 			host := port.IP
@@ -203,6 +210,9 @@ func (w *DockerWatch) refresh(ctx context.Context) error {
 			}
 			wanted[port.PublicPort] = Spec{Host: host, Port: port.PublicPort, HostPort: port.PublicPort, Source: "docker"}
 		}
+	}
+	if previous := w.unsupportedPublications.Swap(unsupported); unsupported > 0 && previous != unsupported {
+		w.report(fmt.Errorf("UDP and other non-TCP host publications are unsupported (%d published bindings)", unsupported))
 	}
 	specs := make([]Spec, 0, len(wanted))
 	for _, spec := range wanted {
